@@ -27,7 +27,7 @@ class RecordingService : Service() {
     private lateinit var mediaProjection: MediaProjection
     private lateinit var audioThread: Job
 
-    private val SERVER_URL = "http://192.168.253.9:5050/upload" // Replace later
+    private val SERVER_URL = "http://192.168.5.29:8000/analyze" // Endpoint expects POST only
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
@@ -85,8 +85,6 @@ class RecordingService : Service() {
 
                 audioRecord.startRecording()
 
-                var previousWavFile: File? = null
-
                 while (isRecording) {
                     val pcmFile = File(externalCacheDir, "chunk_$chunkIndex.pcm")
                     val wavFile = File(externalCacheDir, "chunk_$chunkIndex.wav")
@@ -106,23 +104,13 @@ class RecordingService : Service() {
                     convertPcmToWav(pcmFile, wavFile)
                     pcmFile.delete()
 
-                    if (chunkIndex > 0 && previousWavFile != null && previousWavFile.exists()) {
-                        try {
-                            val client = OkHttpClient()
-                            val getRequest = Request.Builder().url(SERVER_URL).build()
-                            client.newCall(getRequest).execute().use { response ->
-                                if (response.isSuccessful) {
-                                    previousWavFile.delete()
-                                }
-                            }
-                        } catch (e: Exception) {
-                            e.printStackTrace()
-                        }
-                    }
+                    // POST current file to /analyze and wait for result
+                    val resultJson = uploadChunk(wavFile, chunkStart, chunkEnd)
+                    wavFile.delete()
 
-                    uploadChunk(wavFile, chunkStart, chunkEnd)
+                    // Optional: Log or process resultJson here
+                    println("Server response for chunk_$chunkIndex: $resultJson")
 
-                    previousWavFile = wavFile
                     chunkIndex++
                 }
 
@@ -135,33 +123,16 @@ class RecordingService : Service() {
         }
     }
 
-    private fun uploadChunk(file: File, start: Double, end: Double) {
-        try {
+    private fun uploadChunk(file: File, start: Double, end: Double): String? {
+        return try {
             val client = OkHttpClient.Builder()
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
-                .readTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(60, TimeUnit.SECONDS)
                 .build()
-
-            val metadata = JSONObject().apply {
-                put("ambience", JSONObject())
-                put("diarization", JSONObject())
-                put("ai_voice", JSONObject())
-                put("emotion", JSONObject())
-                put("transcription", JSONObject())
-                put("scam_analysis", JSONObject())
-                put("chunks", listOf(
-                    JSONObject().apply {
-                        put("start", start)
-                        put("end", end)
-                        put("chunk_path", file.name)
-                    }
-                ))
-            }
 
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
-                .addFormDataPart("json", metadata.toString())
                 .addFormDataPart("file", file.name,
                     file.asRequestBody("audio/wav".toMediaTypeOrNull()))
                 .build()
@@ -172,10 +143,16 @@ class RecordingService : Service() {
                 .build()
 
             client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) println("Upload failed: ${response.code}")
+                if (response.isSuccessful) {
+                    response.body?.string()
+                } else {
+                    println("Upload failed with code: ${response.code}")
+                    null
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
+            null
         }
     }
 
@@ -237,7 +214,7 @@ class RecordingService : Service() {
 
         val notification = Notification.Builder(this, channelId)
             .setContentTitle("Recording Internal Audio")
-            .setContentText("Recording and uploading in 10s chunks...")
+            .setContentText("Recording and analyzing in 10s chunks...")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .build()
 
