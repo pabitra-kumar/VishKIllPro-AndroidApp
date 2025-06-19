@@ -42,7 +42,7 @@ This Android app records internal audio from your device (like music, video, or 
 
 ### On Your PC (Server Side):
 
-1. Start your Node.js server using the provided `index.js`
+1. Start your server.
 2. Server must be accessible to your phone (e.g. `http://192.168.x.x:800/analyze`)
 3. Ensure server accepts `multipart/form-data` with a field named `file`
 4. Server should respond with a JSON object including `chunks[]`
