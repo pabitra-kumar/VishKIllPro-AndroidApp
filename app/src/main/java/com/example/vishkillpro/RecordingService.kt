@@ -4,10 +4,10 @@ import android.app.*
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.*
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
+import android.net.Uri
 import android.os.Build
 import android.os.IBinder
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import okhttp3.*
@@ -24,27 +24,21 @@ class RecordingService : Service() {
     private var isRecording = false
     private var chunkIndex = 0
     private lateinit var audioRecord: AudioRecord
-    private lateinit var mediaProjection: MediaProjection
     private lateinit var audioThread: Job
 
-    private val SERVER_URL = "http://192.168.5.29:8000/analyze" // Endpoint expects POST only
+    private val SERVER_URL = "http://192.168.0.106:8000/analyze-audio"
+    private val CHANNEL_ID = "recording_channel"
+    private val NOTIFICATION_ID = 1
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
+            != PackageManager.PERMISSION_GRANTED
+        ) {
             stopSelf()
             return START_NOT_STICKY
         }
 
         startForegroundService()
-
-        val resultCode = intent?.getIntExtra("resultCode", Activity.RESULT_CANCELED)
-            ?: return START_NOT_STICKY
-        val data = intent.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
-
-        mediaProjection = (getSystemService(MediaProjectionManager::class.java) as MediaProjectionManager)
-            .getMediaProjection(resultCode, data)
-
         startChunkedRecording()
         return START_STICKY
     }
@@ -57,31 +51,17 @@ class RecordingService : Service() {
                 val sampleRate = 44100
                 val bufferSize = AudioRecord.getMinBufferSize(
                     sampleRate,
-                    AudioFormat.CHANNEL_IN_STEREO,
+                    AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT
                 )
 
-                val config = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                    .build()
-
-                if (ContextCompat.checkSelfPermission(this@RecordingService, android.Manifest.permission.RECORD_AUDIO)
-                    != PackageManager.PERMISSION_GRANTED) {
-                    stopSelf()
-                    return@launch
-                }
-
-                audioRecord = AudioRecord.Builder()
-                    .setAudioPlaybackCaptureConfig(config)
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(bufferSize)
-                    .build()
+                audioRecord = AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize
+                )
 
                 audioRecord.startRecording()
 
@@ -104,12 +84,22 @@ class RecordingService : Service() {
                     convertPcmToWav(pcmFile, wavFile)
                     pcmFile.delete()
 
-                    // POST current file to /analyze and wait for result
                     val resultJson = uploadChunk(wavFile, chunkStart, chunkEnd)
                     wavFile.delete()
 
-                    // Optional: Log or process resultJson here
                     println("Server response for chunk_$chunkIndex: $resultJson")
+
+                    resultJson?.let {
+                        try {
+                            val json = JSONObject(it)
+                            if (json.optBoolean("scam", false)) {
+                                val reasoning = json.optString("reasoning", "Scam detected.")
+                                showScamNotification(reasoning)
+                            }
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
 
                     chunkIndex++
                 }
@@ -133,8 +123,7 @@ class RecordingService : Service() {
 
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
-                .addFormDataPart("file", file.name,
-                    file.asRequestBody("audio/wav".toMediaTypeOrNull()))
+                .addFormDataPart("file", file.name, file.asRequestBody("audio/wav".toMediaTypeOrNull()))
                 .build()
 
             val request = Request.Builder()
@@ -156,11 +145,35 @@ class RecordingService : Service() {
         }
     }
 
+    private fun showScamNotification(reasoning: String) {
+        val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+        val intent = Intent(this, MainActivity::class.java)
+        val pendingIntent = PendingIntent.getActivity(
+            this, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("⚠️ Scam Alert Detected")
+            .setContentText(reasoning.take(80) + if (reasoning.length > 80) "..." else "")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(reasoning))
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setAutoCancel(true)
+            .setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION))
+            .setVibrate(longArrayOf(0, 500, 200, 500))
+            .setFullScreenIntent(pendingIntent, true)
+            .build()
+
+        manager.notify(NOTIFICATION_ID + chunkIndex, notification)
+    }
+
     private fun convertPcmToWav(
         pcmFile: File,
         wavFile: File,
         sampleRate: Int = 44100,
-        channels: Int = 2,
+        channels: Int = 1,
         bitsPerSample: Int = 16
     ) {
         val pcmData = pcmFile.readBytes()
@@ -204,21 +217,34 @@ class RecordingService : Service() {
         )
 
     private fun startForegroundService() {
-        val channelId = "recording_channel"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                channelId, "Audio Recording", NotificationManager.IMPORTANCE_LOW
-            )
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                CHANNEL_ID,
+                "Scam Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                enableLights(true)
+                enableVibration(true)
+                setSound(
+                    RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                        .build()
+                )
+            }
+
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
         }
 
-        val notification = Notification.Builder(this, channelId)
-            .setContentTitle("Recording Internal Audio")
-            .setContentText("Recording and analyzing in 10s chunks...")
+        val notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Recording Voice Audio")
+            .setContentText("Recording from microphone in 10s chunks...")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .build()
 
-        startForeground(1, notification)
+        startForeground(NOTIFICATION_ID, notification)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
